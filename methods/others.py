@@ -34,9 +34,9 @@ class UDA:
         self.data = data
         self.model = None
     
-    def fit(self, outcome_learner='xgb', density_learner='xgb'):
+    def fit(self, outcome_learner='xgb', density_learner='logistic', params=None):
         # Learn density ratios
-        density_models = [DensityModel(learner=density_learner, params=None) for _ in range(self.data.L)]
+        density_models = [DensityModel(learner=density_learner, params=params) for _ in range(self.data.L)]
         sample_weights = []
         for l in range(self.data.L):
             density_models[l].fit(self.data.X_sources_list[l], self.data.X_target)
@@ -125,7 +125,9 @@ class GroupDRO:
             group_losses_tensor = torch.stack(group_losses)  # shape: [num_groups]
             
             # Mirror Ascent: update group weights
-            new_weights = weights * torch.exp(eta * group_losses_tensor)
+            group_losses_tensor_clip = group_losses_tensor.detach()
+            group_losses_tensor_clip = group_losses_tensor_clip - group_losses_tensor_clip.max()  # stabilize
+            new_weights = weights * torch.exp(eta * group_losses_tensor_clip)
             new_weights = new_weights / new_weights.sum()
             weights = new_weights.detach()
             
@@ -158,9 +160,9 @@ class GroupDRO:
 
         # Restore best model weights and group weights
         self.model.load_state_dict(best_model_state)
-        weights = best_weights.clone()
+        print('model saved')
 
-    def predict(self, X):
+    def predict(self, X, batch_size=512):
         """
         Makes predictions using the trained model.
 
@@ -171,7 +173,11 @@ class GroupDRO:
             np.ndarray: Predicted continuous outcomes.
         """
         self.model.eval()
+        print('model eval')
+        preds_list = []
         with torch.no_grad():
-            X_tensor = torch.tensor(X, dtype=torch.float32)
-            preds = self.model(X_tensor).numpy().flatten()
-        return preds
+            for i in range(0, X.shape[0], batch_size):
+                X_batch = torch.tensor(X[i:i+batch_size], dtype=torch.float32)
+                preds_batch = self.model(X_batch).detach().numpy()
+                preds_list.append(preds_batch)
+        return np.vstack(preds_list).flatten()

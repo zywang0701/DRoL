@@ -3,6 +3,7 @@ from sklearn.linear_model import LinearRegression, LogisticRegression
 import xgboost as xgb
 from sklearn.model_selection import GridSearchCV, KFold, StratifiedKFold
 
+
 def reward(Y, Y_pred):
     return np.mean(Y**2 - (Y - Y_pred) ** 2)
 
@@ -78,6 +79,8 @@ class DensityModel:
         self.sample_ratio = X.shape[0] / X_target.shape[0]
         X_concat = np.vstack((X, X_target))
         Y_concat = np.concatenate((np.zeros(X.shape[0]), np.ones(X_target.shape[0])))
+        if self.learner == 'oracle':
+            pass
         if self.learner == 'logistic':
             self.model = LogisticRegression(solver='lbfgs').fit(X_concat, Y_concat)
             param_grid = None
@@ -94,29 +97,61 @@ class DensityModel:
                 'subsample': [0.8], #, 1.0],         # Row fraction
                 'colsample_bytree': [0.8] # [0.8, 1.0],  # Feature fraction
             }
-            # param_grid = {
-            #     'learning_rate': [0.01, 0.05, 0.1],    # Step size shrinkage used in update to prevents overfitting
-            #     'max_depth': [3, 6, 9],          # Maximum depth of a tree
-            #     'subsample': [0.8, 1.0],         # Row fraction
-            #     'colsample_bytree': [0.8, 1.0],  # Feature fraction
-            # }
-            if self.params is not None:
-                self.model.set_params(**self.params)
-                self.model.fit(X_concat, Y_concat)
-            else:
-                stratified_kfold = StratifiedKFold(n_splits=5, shuffle=True, random_state=seed)
-                grid = GridSearchCV(estimator = self.model, 
-                                    param_grid = param_grid, 
-                                    cv=stratified_kfold,
-                                    scoring='neg_log_loss',
-                                    n_jobs=-1,
-                                    verbose=verbose)
-                grid.fit(X_concat, Y_concat)
-                self.model = grid.best_estimator_
-                self.params = grid.best_params_
+            stratified_kfold = StratifiedKFold(n_splits=5, shuffle=True, random_state=seed)
+            grid = GridSearchCV(estimator = self.model, 
+                                param_grid = param_grid, 
+                                cv=stratified_kfold,
+                                scoring='neg_log_loss',
+                                n_jobs=-1,
+                                verbose=verbose)
+            grid.fit(X_concat, Y_concat)
+            self.model = grid.best_estimator_
         
     
     def predict(self, X):
-        proba_ratio = self.model.predict_proba(X)[:, 1] / self.model.predict_proba(X)[:, 0]
+        if self.learner == 'oracle':
+            mu_p = self.params['X_mean']
+            cov_p = self.params['X_cov']
+            mu_q = self.params['X0_mean']
+            cov_q = self.params['X0_cov']
+            proba_ratio = self._gaussian_likelihood_ratio(X, mu_p, cov_p, mu_q, cov_q)
+        else:
+            proba_ratio = self.model.predict_proba(X)[:, 1] / self.model.predict_proba(X)[:, 0]
         omega = proba_ratio * self.sample_ratio
         return omega
+
+    def _gaussian_likelihood_ratio(self, X, mu_p, cov_p, mu_q, cov_q):
+        """
+        Compute dQ(x)/dP(x) for each row x in X, where Q and P are multivariate Gaussians.
+        
+        Parameters:
+            X      : (n, d) data matrix, each row is a sample
+            mu_p   : (d,) mean of P
+            cov_p  : (d, d) covariance of P
+            mu_q   : (d,) mean of Q
+            cov_q  : (d, d) covariance of Q
+            
+        Returns:
+            ratio  : (n,) vector of likelihood ratios dQ(x)/dP(x)
+        """
+        mu_p = mu_p.reshape(1, -1)
+        mu_q = mu_q.reshape(1, -1)
+
+        # Precompute inverses and log-determinants
+        inv_cov_p = np.linalg.inv(cov_p)
+        inv_cov_q = np.linalg.inv(cov_q)
+        log_det_cov_p = np.log(np.linalg.det(cov_p))
+        log_det_cov_q = np.log(np.linalg.det(cov_q))
+
+        # Compute Mahalanobis distances for all samples
+        diff_p = X - mu_p      # (n, d)
+        diff_q = X - mu_q      # (n, d)
+
+        quad_p = np.einsum('ni,ij,nj->n', diff_p, inv_cov_p, diff_p)
+        quad_q = np.einsum('ni,ij,nj->n', diff_q, inv_cov_q, diff_q)
+
+        # Compute log-likelihood ratio (to avoid numerical underflow)
+        log_ratio = 0.5 * (log_det_cov_p - log_det_cov_q + quad_p - quad_q)
+        ratio = np.exp(log_ratio)
+        
+        return ratio

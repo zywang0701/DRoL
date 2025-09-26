@@ -11,7 +11,7 @@ class DRoL:
         self.pred_full_mat = None
         self.source_full_models = None
     
-    def fit(self, outcome_learner='xgb', density_learner='xgb'):
+    def fit(self, outcome_learner='xgb', density_learner='logistic', params=None):
         """Compute the plug-in and bias-corrected estimators of the Gamma matrix.
 
         Args:
@@ -33,21 +33,22 @@ class DRoL:
         # The plug-in estimator of Gamma matrix
         self.Gamma_plug = self.pred_full_mat.T @ self.pred_full_mat / N
         
-        # Use the sample-split source data to fit
+        # ------------ Bias-Corrected Estimator of Gamma matrix ------------
+        self.Gamma_corr = self.Gamma_plug.copy()
+        
+        # Use the sample-split source data to fit (i) conditional outcome models and (ii) density ratio models
         source_A_models = [OutcomeModel(learner=outcome_learner, params=None) for l in range(L)]
         source_B_models = [OutcomeModel(learner=outcome_learner, params=None) for l in range(L)]
-        density_A_models = [DensityModel(learner=density_learner, params=None) for l in range(L)]
-        density_B_models = [DensityModel(learner=density_learner, params=None) for l in range(L)]
+        density_A_models = [DensityModel(learner=density_learner, params=params) for l in range(L)]
+        density_B_models = [DensityModel(learner=density_learner, params=params) for l in range(L)]
         for l in range(L):
             half_l = nl_s[l] // 2
             source_A_models[l].fit(self.data.X_sources_list[l][:half_l], self.data.Y_sources_list[l][:half_l])
             source_B_models[l].fit(self.data.X_sources_list[l][half_l:], self.data.Y_sources_list[l][half_l:])
             density_A_models[l].fit(self.data.X_sources_list[l][:half_l], self.data.X_target)
             density_B_models[l].fit(self.data.X_sources_list[l][half_l:], self.data.X_target)
-        
-        # ------------ Bias-Corrected Estimator of Gamma matrix ------------
-        self.Gamma_corr = self.Gamma_plug.copy()
-        
+
+        # Use the cross-fitting strategy to compute the bias-corrected terms
         for k in range(L):
             fkA = source_A_models[k]
             fkB = source_B_models[k]
@@ -63,21 +64,27 @@ class DRoL:
                 half_l = nl_s[l] // 2
                 
                 num1A = self._bias_correct(fkA, flA, wlA,
-                                           self.data.X_sources_list[l][half_l:],
-                                           self.data.Y_sources_list[l][half_l:])
+                                        self.data.X_sources_list[l][half_l:],
+                                        self.data.Y_sources_list[l][half_l:])
                 num2A = self._bias_correct(flA, fkA, wkA,
-                                           self.data.X_sources_list[k][half_k:],
-                                           self.data.Y_sources_list[k][half_k:])
+                                        self.data.X_sources_list[k][half_k:],
+                                        self.data.Y_sources_list[k][half_k:])
                 num1B = self._bias_correct(fkB, flB, wlB,
-                                           self.data.X_sources_list[l][:half_l],
-                                           self.data.Y_sources_list[l][:half_l])
+                                        self.data.X_sources_list[l][:half_l],
+                                        self.data.Y_sources_list[l][:half_l])
                 num2B = self._bias_correct(flB, fkB, wkB,
-                                           self.data.X_sources_list[k][:half_k],
-                                           self.data.Y_sources_list[k][:half_k])
+                                        self.data.X_sources_list[k][:half_k],
+                                        self.data.Y_sources_list[k][:half_k])
                 self.Gamma_corr[k, l] -= (num1A + num2A + num1B + num2B) / 2
         
         self.Gamma_corr = (self.Gamma_corr.T + self.Gamma_corr) / 2
+            
+        # Ensure the positive definiteness of the corrected Gamma matrix
+        eigvals, eigvecs = np.linalg.eigh(self.Gamma_corr)
+        eigvals[eigvals < 1e-5] = 1e-5
+        self.Gamma_corr = eigvecs @ np.diag(eigvals) @ eigvecs.T
         
+
     def predict(self, bias_correct=True, priors=None):
         """Estimate the optimal aggregation weights using the estimated Gamma matrix,
         and yield the robust prediction on the target domain.
